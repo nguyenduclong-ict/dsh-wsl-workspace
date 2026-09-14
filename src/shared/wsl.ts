@@ -31,6 +31,34 @@ export function decodeWslOutput(buffer: Buffer): string {
   return buffer.includes(0) ? buffer.toString('utf16le') : buffer.toString('utf8')
 }
 
+/** The value a promisified `execFile` resolves to in the normal case. */
+type ExecFileResult = { stdout: Buffer | string; stderr: Buffer | string }
+
+/**
+ * Extract stdout from a promisified `execFile` result as a Buffer. DSH
+ * Desktop patches `child_process.execFile` without carrying
+ * `util.promisify.custom`, so `promisify(execFile)` falls back to generic
+ * callback promisification and resolves to the raw stdout value instead of
+ * `{ stdout, stderr }`. Accept both shapes so discovery works on the Desktop
+ * and CLI hosts alike.
+ */
+function stdoutBufferOf(result: unknown): Buffer {
+  if (Buffer.isBuffer(result)) return result
+  const stdout = (result as Partial<ExecFileResult> | undefined)?.stdout
+  if (Buffer.isBuffer(stdout)) return stdout
+  if (typeof stdout === 'string') return Buffer.from(stdout)
+  throw new Error('wsl-workspace: unexpected execFile result shape')
+}
+
+/** Extract stdout from a promisified `execFile` result as text (see {@link stdoutBufferOf}). */
+function stdoutTextOf(result: unknown): string {
+  if (typeof result === 'string') return result
+  const stdout = (result as Partial<ExecFileResult> | undefined)?.stdout
+  if (typeof stdout === 'string') return stdout
+  if (Buffer.isBuffer(stdout)) return decodeWslOutput(stdout)
+  throw new Error('wsl-workspace: unexpected execFile result shape')
+}
+
 /**
  * List installed WSL distributions in `wsl.exe` order.
  * @param wslPath - the `wsl.exe` executable (absolute or PATH name).
@@ -40,7 +68,7 @@ export async function listDistros(wslPath = 'wsl.exe'): Promise<string[]> {
   let stdout: Buffer
   try {
     const result = await execFileAsync(wslPath, ['-l', '-q'], { encoding: 'buffer', timeout: DISCOVERY_TIMEOUT_MS })
-    stdout = result.stdout as Buffer
+    stdout = stdoutBufferOf(result)
   } catch (error) {
     throw new Error(`wsl-workspace: cannot list WSL distributions (${messageOf(error)}); is WSL installed?`)
   }
@@ -61,12 +89,12 @@ export async function defaultDistro(): Promise<string | undefined> {
     const value = await execFileAsync('reg.exe', ['query', LXSS_KEY, '/v', 'DefaultDistribution'], {
       timeout: DISCOVERY_TIMEOUT_MS,
     })
-    const guid = /DefaultDistribution\s+REG_SZ\s+(\{[0-9a-fA-F-]+\})/i.exec(value.stdout)?.[1]
+    const guid = /DefaultDistribution\s+REG_SZ\s+(\{[0-9a-fA-F-]+\})/i.exec(stdoutTextOf(value))?.[1]
     if (guid === undefined) return undefined
     const name = await execFileAsync('reg.exe', ['query', `${LXSS_KEY}\\${guid}`, '/v', 'DistributionName'], {
       timeout: DISCOVERY_TIMEOUT_MS,
     })
-    const distro = /DistributionName\s+REG_SZ\s+(.+)/i.exec(name.stdout)?.[1]?.trim()
+    const distro = /DistributionName\s+REG_SZ\s+(.+)/i.exec(stdoutTextOf(name))?.[1]?.trim()
     return distro === undefined || distro === '' ? undefined : distro
   } catch {
     return undefined

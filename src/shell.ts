@@ -1,7 +1,7 @@
 /**
  * WSL Service Provider for the `ctx.shell` capability seam. Every command
  * runs inside one WSL distribution as `wsl.exe -d <distro> [-u <user>]
- * --cd <linux cwd> -e bash -lc <command>`, so the model-facing bash dialect
+ * --cd <linux cwd> -e bash -lic <command>`, so the model-facing bash dialect
  * matches the execution world exactly — the "like direct calls" experience
  * of a WSL workspace session.
  *
@@ -76,8 +76,15 @@ export interface Config {
   username?: string
   /** The `wsl.exe` executable (absolute path or PATH name). */
   wslPath?: string
-  /** Start bash as a login shell (`-lc`) so user profile PATHs (nvm, cargo…) load. */
+  /** Start bash as a login shell (`-l`) so `/etc/profile` + `.profile`/`.bash_profile` load. */
   loginShell?: boolean
+  /**
+   * Start bash as an interactive shell (`-i`) so `~/.bashrc` loads. Ubuntu's
+   * default `.bashrc` early-returns when `$-` lacks `i`, which is why a login
+   * shell alone (`-lc`) misses nvm/pyenv/cargo PATHs. Disable only when your
+   * `.bashrc` prints banners or errors under an interactive shell.
+   */
+  interactiveShell?: boolean
   /** Default foreground timeout in milliseconds. */
   timeoutMs?: number
   /** Upper bound for per-call timeout overrides. */
@@ -163,6 +170,7 @@ export class WslShellExecutor extends ShellExecutor {
     username: z.string(),
     wslPath: z.string().default('wsl.exe'),
     loginShell: z.boolean().default(true),
+    interactiveShell: z.boolean().default(true),
     timeoutMs: z.number().default(120_000),
     maxTimeoutMs: z.number().default(600_000),
     maxOutputBytes: z.number().default(64_000),
@@ -250,14 +258,19 @@ export class WslShellExecutor extends ShellExecutor {
       username = this.resolveUser(spec, undefined)
     }
     const env = this.withWslEnv(spec)
-    // A login shell (`-lc`) loads /etc/profile + the user profile chain, and
-    // several of those reset the cwd to $HOME (observed on Ubuntu 22.04 with
-    // a zsh user default: `wsl.exe --cd <dir> -e bash -lc 'pwd'` prints the
-    // home directory, while `-c` honors `--cd`). The model-facing cwd must
-    // be the resolved workdir in both modes, so prefix an explicit `cd`
-    // when the login shell runs. `cd` into a deleted directory fails the
-    // command exactly like `--cd` would; the failure text is unchanged.
-    const command = this.config.loginShell
+    // A login shell (`-l`) loads /etc/profile + the user profile chain, and
+    // an interactive shell (`-i`) loads ~/.bashrc; Ubuntu's default .bashrc
+    // early-returns when non-interactive, so a login-only shell (`-lc`) misses
+    // nvm/pyenv/cargo PATHs. Several startup files reset the cwd to $HOME
+    // (observed on Ubuntu 22.04 with a zsh user default: `wsl.exe --cd <dir>
+    // -e bash -lc 'pwd'` prints the home directory, while `-c` honors `--cd`).
+    // The model-facing cwd must be the resolved workdir in every mode, so
+    // prefix an explicit `cd` whenever startup files run. `cd` into a deleted
+    // directory fails the command exactly like `--cd` would; the failure text
+    // is unchanged.
+    const login = this.config.loginShell
+    const interactive = this.config.interactiveShell
+    const command = login || interactive
       ? `cd '${linuxCwd.replace(/'/g, `'\\''`)}' && ${spec.command}`
       : spec.command
     const argv = [
@@ -266,7 +279,7 @@ export class WslShellExecutor extends ShellExecutor {
       ...(username !== undefined && username !== '' ? ['-u', username] : []),
       '--cd', linuxCwd,
       '-e', 'bash',
-      this.config.loginShell ? '-lc' : '-c',
+      `-${login ? 'l' : ''}${interactive ? 'i' : ''}c`,
       command,
     ]
     return { distro, linuxCwd, windowsCwd, env, argv }
